@@ -1,6 +1,5 @@
 #!/usr/bin/env python
-
-
+from collections import OrderedDict
 from pySIR.pySIR import pySIR
 
 import sys
@@ -13,6 +12,7 @@ import time
 import datetime
 
 import logging
+
 logger = logging.getLogger('fib_optimizer')
 
 log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -73,64 +73,86 @@ def complete_prefix_list():
 '''
 
 
-def get_variables():
+def show_error_and_exit(msg):
+    logger.error(msg)
+    exit(1)
+
+
+def get_variables(sir_object):
     logger.debug('Getting variables from SIR')
-    v = sir.get_variables_by_category_and_name('apps', 'fib_optimizer').result[0]
-    logger.debug('Configuration: {}'.format(json.loads(v['content'])))
-    return json.loads(v['content'])
+    config = None
+    api_call = sir_object.get_variables_by_category_and_name('apps', 'fib_optimizer').result
+
+    if not api_call:
+        show_error_and_exit('Failed to obtain configuration')
+
+    if len(api_call) != 1:
+        show_error_and_exit('No configuration variables found for fib_optimizer app')
+    config = api_call[0]
+    logger.debug('Configuration: {}'.format(json.loads(config)))
+
+    configuration_keys = ['age', 'lem_prefixes', 'max_lpm_prefixes', 'path', 'purge_older_than']
+    missing_keys = [k for k in configuration_keys if k not in config.keys()]
+
+    if missing_keys:
+        show_error_and_exit(
+            'the following configuration variables are not defined:{missing_keys}'.format(missing_keys=missing_keys))
+
+    return json.loads(api_call['content'])
 
 
-def get_date_range():
+def get_date_range(conf):
     # These are dates for which we have flows. We want to "calculate" the range we want to use
     # to calculate the topN prefixes
 
     logger.debug('Getting available dates')
-    dates = sir.get_available_dates().result
+    api_call = sir.get_available_dates().result
 
-    if len(dates) < conf['age']:
-        sd = dates[0]
+    if not api_call:
+        show_error_and_exit("Failed to obtain dates")
+
+    if len(api_call) < conf['age']:
+        start_date = api_call[0]
     else:
-        sd = dates[-conf['age']]
-    ed = dates[-1]
+        start_date = api_call[-conf['age']]
+    end_date = api_call[-1]
 
-    logger.debug("Date range: {} - {}".format(sd, ed))
+    logger.debug("Date range: {} - {}".format(start_date, end_date))
 
-    time_delta = datetime.datetime.now() - datetime.datetime.strptime(ed, '%Y-%m-%dT%H:%M:%S')
+    time_delta = datetime.datetime.now() - datetime.datetime.strptime(end_date, '%Y-%m-%dT%H:%M:%S')
 
     if time_delta.days > 2:
-        msg = 'Data is more than 48 hours old: {}'.format(ed)
-        logger.error(msg)
-        raise Exception(msg)
+        show_error_and_exit('Data is more than 48 hours old: {}'.format(end_date))
 
-    return sd, ed
+    return start_date, end_date
 
 
-def get_top_prefixes():
+def get_top_prefixes(conf):
     logger.debug('Getting top prefixes')
     # limit_lem = int(conf['max_lem_prefixes']) - len(inc_lem) + len(exc_lem)
-    limit_lem = int(conf['max_lem_prefixes'])
-    lem = [p['key'] for p in sir.get_top_prefixes(
+
+    options = ['lem', 'lpm']
+    option_values = OrderedDict()
+    for option in options:
+
+        api_call = sir.get_top_prefixes(
             start_time=start_time,
             end_time=end_time,
-            limit_prefixes=limit_lem,
+            limit_prefixes=int(conf['max_{option}_prefixes'.format(option=option)]),
             net_masks=conf['lem_prefixes'],
             filter_proto=4,
-        ).result]
+        ).result
+        if not api_call:
+            show_error_and_exit('error getting top prefixes for {option}'.format(option=option))
+
+        option_values[option] = [p['key'] for p in api_call]
 
     # limit_lpm = int(conf['max_lpm_prefixes']) - len(inc_lpm) + len(exc_lpm)
-    limit_lpm = int(conf['max_lpm_prefixes'])
-    lpm = [p['key'] for p in sir.get_top_prefixes(
-            start_time=start_time,
-            end_time=end_time,
-            limit_prefixes=limit_lpm,
-            net_masks=conf['lem_prefixes'],
-            filter_proto=4,
-            exclude_net_masks=1,
-        ).result]
-    return lem, lpm
+
+    return option_values.values()
 
 
-def build_prefix_lists():
+def build_prefix_lists(conf):
     logger.debug('Storing prefix lists in disk')
 
     def _build_pl(name, prefixes):
@@ -145,13 +167,13 @@ def build_prefix_lists():
     _build_pl('fib_optimizer_lem_v4', lem_prefixes)
 
 
-def install_prefix_lists():
+def install_prefix_lists(conf):
     logger.debug('Installing the prefix-lists in the system')
 
     cli_lpm = shlex.split('printf "conf t\n ip prefix-list fib_optimizer_lpm_v4 file:{}/fib_optimizer_lpm_v4"'.format(
-                                                                                                        conf['path']))
+        conf['path']))
     cli_lem = shlex.split('printf "conf t\n ip prefix-list fib_optimizer_lem_v4 file:{}/fib_optimizer_lem_v4"'.format(
-                                                                                                        conf['path']))
+        conf['path']))
     cli = shlex.split('sudo ip netns exec default FastCli -p 15 -A')
 
     p_lpm = subprocess.Popen(cli_lpm, stdout=subprocess.PIPE)
@@ -163,7 +185,7 @@ def install_prefix_lists():
     p_cli = subprocess.Popen(cli, stdin=p_lem.stdout, stdout=subprocess.PIPE)
 
 
-def merge_pl():
+def merge_pl(conf):
     logger.debug('Merging new prefix-list with existing ones')
 
     def _merge_pl(pl, pl_file, max_p):
@@ -175,11 +197,9 @@ def merge_pl():
                     seq, permit, prefix = line.split(' ')
                     original_pl[prefix.rstrip()] = int(seq)
 
-            if len(original_pl)*0.75 > len(pl):
-                msg = 'New prefix list ({}) is more than 25\% smaller than the new one ({})'.format(
-                                                                                            len(original_pl), len(pl))
-                logger.error(msg)
-                raise Exception(msg)
+            if len(original_pl) * 0.75 > len(pl):
+                show_error_and_exit('New prefix list ({}) is more than 25\% smaller than the old one ({})'.format(
+                    len(pl), len(original_pl)))
 
             new_prefixes = set(pl) - set(original_pl.keys())
             existing_prefixes = set(pl) & set(original_pl.keys())
@@ -188,7 +208,7 @@ def merge_pl():
             for p in existing_prefixes:
                 new_pl[original_pl[p]] = p
 
-            empty_pos = sorted(list(set(xrange(1, int(max_p)+1)) - set(original_pl.values())))
+            empty_pos = sorted(list(set(xrange(1, int(max_p) + 1)) - set(original_pl.values())))
             for p in new_prefixes:
                 new_pl[empty_pos.pop(0)] = p
 
@@ -208,14 +228,18 @@ def merge_pl():
     return lem, lpm
 
 
-def purge_old_data():
+def purge_old_data(conf):
     logger.debug('Purging old data')
     date = datetime.datetime.now() - datetime.timedelta(hours=conf['purge_older_than'])
     date_text = date.strftime('%Y-%m-%dT%H:%M:%S')
     logger.debug('Deleting BGP data older than: {}'.format(date_text))
-    sir.purge_bgp(older_than=date_text)
+    api_call = sir.purge_bgp(older_than=date_text)
+    if not api_call:
+        show_error_and_exit('Error purging bgp data')
     logger.debug('Deleting flow data older than: {}'.format(date_text))
-    sir.purge_flows(older_than=date_text)
+    api_call2 = sir.purge_flows(older_than=date_text)
+    if not api_call2:
+        show_error_and_exit('Error purging flow data')
 
 
 if __name__ == "__main__":
@@ -231,19 +255,19 @@ if __name__ == "__main__":
     sir = pySIR(sys.argv[1], verify_ssl=False)
 
     # We get the configuration for our application
-    conf = get_variables()
+    conf = get_variables(sir)
 
     # The time range we want to process
-    start_time, end_time = get_date_range()
+    start_time, end_time = get_date_range(conf)
 
     # We get the Top prefixes. Included and excluded prefixes are merged as well
-    lem_prefixes, lpm_prefixes = get_top_prefixes()
+    lem_prefixes, lpm_prefixes = get_top_prefixes(conf)
 
     # If the prefix list exists already we merge the data
-    lem_prefixes, lpm_prefixes = merge_pl()
+    lem_prefixes, lpm_prefixes = merge_pl(conf)
 
     # We build the files with the prefix lists
-    build_prefix_lists()
-    install_prefix_lists()
-    purge_old_data()
+    build_prefix_lists(conf)
+    install_prefix_lists(conf)
+    purge_old_data(conf)
     logger.info('End fib_optimizer')
